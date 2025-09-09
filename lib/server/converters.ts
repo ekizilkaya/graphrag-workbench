@@ -3,15 +3,36 @@ import path from 'node:path'
 // Avoid top-level import to prevent Turbopack from trying to load test assets from pdf-parse
 // Dynamically import inside the function instead
 import parquet from 'parquetjs-lite'
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 
-function execFileP(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<{ stdout: string; stderr: string }> {
+// A more robust function to spawn a process and capture its output
+function spawnP(cmd: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv } = {}): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
-    execFile(cmd, args, opts, (err, stdout, stderr) => {
-      if (err) return reject(err)
-      resolve({ stdout: String(stdout), stderr: String(stderr) })
-    })
-  })
+    const child = spawn(cmd, args, opts);
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        // Reject with a detailed error
+        return reject(new Error(`Process exited with code ${code}\nStderr: ${stderr}\nStdout: ${stdout}`));
+      }
+      resolve({ stdout, stderr });
+    });
+
+    child.on('error', (err) => {
+      // This catches errors like "command not found"
+      reject(err);
+    });
+  });
 }
 
 export async function convertPdfToText(pdfPath: string, outputDir: string, outputName?: string): Promise<string> {
@@ -50,16 +71,36 @@ async function readParquetAll(filePath: string): Promise<unknown[]> {
   }
 }
 
+// THIS IS THE MODIFIED FUNCTION
 async function readParquetViaPython(filePath: string): Promise<unknown[]> {
-  const py = process.env.PYTHON || 'python3'
-  const code = [
+  // Define the exact Python executable
+  const pythonExe = "C:/Users/EMRE/anaconda3/envs/graphrag_env/python.exe";
+  
+  // Define the Python code to run
+  const pythonCode = [
     'import sys, json',
     'import pyarrow.parquet as pq',
     'tbl = pq.read_table(sys.argv[1])',
     'print(json.dumps(tbl.to_pylist()))',
-  ].join('; ')
-  const { stdout } = await execFileP(py, ['-c', code, filePath])
-  try { return JSON.parse(stdout) as unknown[] } catch { return [] }
+  ].join('; ');
+  
+  // Construct the full command to be run inside the shell
+  // We use single quotes around the pythonCode to pass it as a single argument to python's -c flag
+  const commandToRun = `"${pythonExe}" -c '${pythonCode}' "${filePath}"`;
+
+  try {
+    // Use spawnP to run the command inside a bash login shell, just like the working indexer
+    const { stdout, stderr } = await spawnP('bash', ['-lc', commandToRun]);
+    
+    if (stderr) {
+      console.warn('Stderr from python converter:', stderr);
+    }
+    
+    return JSON.parse(stdout) as unknown[];
+  } catch (error) {
+    console.error('Failed to execute python converter script:', error);
+    return [];
+  }
 }
 
 export async function convertGraphParquetToJson(outputDir: string): Promise<{ converted: number }>{
